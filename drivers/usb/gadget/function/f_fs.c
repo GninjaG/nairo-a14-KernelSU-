@@ -940,7 +940,7 @@ static ssize_t __ffs_epfile_read_data(struct ffs_epfile *epfile,
 static ssize_t ffs_epfile_io(struct file *file, struct ffs_io_data *io_data)
 {
 	struct ffs_epfile *epfile = file->private_data;
-	struct ffs_data *ffs = epfile->ffs;
+	struct ffs_data *ffs;
 	struct usb_request *req;
 	struct ffs_ep *ep;
 	char *data = NULL;
@@ -948,11 +948,12 @@ static ssize_t ffs_epfile_io(struct file *file, struct ffs_io_data *io_data)
 	int halt;
 	size_t extra_buf_alloc = 0;
 
-	ffs_log("enter: %s", epfile->name);
-
 	/* Are we still active? */
 	if (WARN_ON(epfile->ffs->state != FFS_ACTIVE))
 		return -ENODEV;
+
+	ffs = epfile->ffs;
+	ffs_log("enter: %s", epfile->name);
 
 	/* Wait for endpoint to be enabled */
 	ep = epfile->ep;
@@ -1339,10 +1340,13 @@ ffs_epfile_release(struct inode *inode, struct file *file)
 {
 	struct ffs_epfile *epfile = inode->i_private;
 	struct ffs_data *ffs = epfile->ffs;
+	unsigned long flags;
 
 	ENTER();
 
+	spin_lock_irqsave(&epfile->ffs->eps_lock, flags);
 	__ffs_epfile_read_buffer_free(epfile);
+	spin_unlock_irqrestore(&epfile->ffs->eps_lock, flags);
 	ffs_log("%s: state %d setup_state %d flag %lu opened %u",
 		epfile->name, epfile->ffs->state, epfile->ffs->setup_state,
 		epfile->ffs->flags, atomic_read(&epfile->opened));
@@ -1705,8 +1709,12 @@ ffs_fs_mount(struct file_system_type *t, int flags,
 		return ERR_PTR(ret);
 
 	ffs = ffs_data_new(dev_name);
-	if (unlikely(!ffs))
-		return ERR_PTR(-ENOMEM);
+	if (IS_ERR_OR_NULL(ffs)) {
+		if (!ffs)
+			return ERR_PTR(-ENOMEM);
+		else
+			return ERR_PTR((long) ffs);
+	}
 
 	if (IS_ERR(ffs))
 		return ERR_PTR(-EBUSY);
@@ -1843,11 +1851,13 @@ static void ffs_data_closed(struct ffs_data *ffs)
 	if (atomic_dec_and_test(&ffs->opened)) {
 		if (ffs->no_disconnect) {
 			ffs->state = FFS_DEACTIVATED;
+			mutex_lock(&ffs->mutex);
 			if (ffs->epfiles) {
 				ffs_epfiles_destroy(ffs->epfiles,
 						   ffs->eps_count);
 				ffs->epfiles = NULL;
 			}
+			mutex_unlock(&ffs->mutex);
 			if (ffs->setup_state == FFS_SETUP_PENDING)
 				__ffs_ep0_stall(ffs);
 		} else {
@@ -1919,15 +1929,22 @@ static void ffs_data_clear(struct ffs_data *ffs)
 
 	BUG_ON(ffs->gadget);
 
-	if (ffs->epfiles)
+	mutex_lock(&ffs->mutex);
+	if (ffs->epfiles) {
 		ffs_epfiles_destroy(ffs->epfiles, ffs->eps_count);
+		ffs->epfiles = NULL;
+	}
 
 	if (ffs->ffs_eventfd)
 		eventfd_ctx_put(ffs->ffs_eventfd);
 
 	kfree(ffs->raw_descs_data);
+	ffs->raw_descs_data = NULL;
 	kfree(ffs->raw_strings);
+	ffs->raw_strings = NULL;
 	kfree(ffs->stringtabs);
+	ffs->stringtabs = NULL;
+	mutex_unlock(&ffs->mutex);
 }
 
 static void ffs_data_reset(struct ffs_data *ffs)
@@ -1939,11 +1956,7 @@ static void ffs_data_reset(struct ffs_data *ffs)
 
 	ffs_data_clear(ffs);
 
-	ffs->epfiles = NULL;
-	ffs->raw_descs_data = NULL;
 	ffs->raw_descs = NULL;
-	ffs->raw_strings = NULL;
-	ffs->stringtabs = NULL;
 
 	ffs->raw_descs_length = 0;
 	ffs->fs_descs_count = 0;
@@ -2083,16 +2096,19 @@ static void ffs_epfiles_destroy(struct ffs_epfile *epfiles, unsigned count)
 
 static void ffs_func_eps_disable(struct ffs_function *func)
 {
-	struct ffs_ep *ep         = func->eps;
 	struct ffs_data *ffs      = func->ffs;
-	struct ffs_epfile *epfile = func->ffs->epfiles;
-	unsigned count            = func->ffs->eps_count;
+	struct ffs_ep *ep;
+	struct ffs_epfile *epfile;
+	unsigned short count;
 	unsigned long flags;
 
 	ffs_log("enter: state %d setup_state %d flag %lu", func->ffs->state,
 		func->ffs->setup_state, func->ffs->flags);
 
 	spin_lock_irqsave(&func->ffs->eps_lock, flags);
+	count = func->ffs->eps_count;
+	epfile = func->ffs->epfiles;
+	ep = func->eps;
 	while (count--) {
 		/* pending requests get nuked */
 		if (likely(ep->ep))
@@ -3801,8 +3817,10 @@ static void ffs_func_unbind(struct usb_configuration *c,
 		ffs->func = NULL;
 	}
 
-	if (!--opts->refcnt)
+	if (!--opts->refcnt) {
+		ffs_event_add(ffs, FUNCTIONFS_UNBIND);
 		functionfs_unbind(ffs);
+	}
 
 	/* cleanup after autoconfig */
 	spin_lock_irqsave(&func->ffs->eps_lock, flags);
@@ -3826,10 +3844,12 @@ static void ffs_func_unbind(struct usb_configuration *c,
 	func->function.ssp_descriptors = NULL;
 	func->interfaces_nums = NULL;
 
-	ffs_event_add(ffs, FUNCTIONFS_UNBIND);
+	if (opts->refcnt) {
+		ffs_event_add(ffs, FUNCTIONFS_UNBIND);
 
-	ffs_log("exit: state %d setup_state %d flag %lu", ffs->state,
-		ffs->setup_state, ffs->flags);
+		ffs_log("exit: state %d setup_state %d flag %lu", ffs->state,
+			ffs->setup_state, ffs->flags);
+	}
 }
 
 static struct usb_function *ffs_alloc(struct usb_function_instance *fi)

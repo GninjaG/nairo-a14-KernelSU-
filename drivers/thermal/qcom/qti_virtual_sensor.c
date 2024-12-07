@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2017-2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2017-2019,2021, The Linux Foundation. All rights reserved.
  */
 
 #include <linux/thermal.h>
@@ -207,6 +207,16 @@ static const struct virtual_sensor_data qti_virtual_sensors[] = {
 	},
 #else
 	{
+		.virt_zone_name = "penta-cpu-max-step",
+		.num_sensors = 5,
+		.sensor_names = {"apc1-cpu0-usr",
+				"apc1-cpu1-usr",
+				"apc1-cpu2-usr",
+				"apc1-cpu3-usr",
+				"cpuss-usr"},
+		.logic = VIRT_MAXIMUM,
+	},
+        {
 		/* Temp above rear qtm */
 		.virt_zone_name = "mmw0-surface-step",
 		.num_sensors = 1,

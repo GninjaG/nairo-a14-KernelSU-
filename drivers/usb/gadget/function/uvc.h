@@ -64,7 +64,7 @@ extern unsigned int uvc_gadget_trace_param;
  * Driver specific constants
  */
 
-#define UVC_NUM_REQUESTS			32
+#define UVC_NUM_REQUESTS			64
 #define UVC_MAX_REQUEST_SIZE			64
 #define UVC_MAX_EVENTS				4
 
@@ -113,6 +113,7 @@ struct uvc_device {
 	enum uvc_state state;
 	struct usb_function func;
 	struct uvc_video video;
+	bool func_connected;
 
 	/* Descriptors */
 	struct {
@@ -146,6 +147,7 @@ static inline struct uvc_device *to_uvc(struct usb_function *f)
 struct uvc_file_handle {
 	struct v4l2_fh vfh;
 	struct uvc_video *device;
+	bool is_uvc_app_handle;
 };
 
 #define to_uvc_file_handle(handle) \

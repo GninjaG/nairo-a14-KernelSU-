@@ -320,12 +320,10 @@ void dwc3_gadget_giveback(struct dwc3_ep *dep, struct dwc3_request *req,
 
 	dwc3_gadget_del_and_unmap_request(dep, req, status);
 
-	if (usb_endpoint_xfer_isoc(dep->endpoint.desc)) {
-		if (list_empty(&dep->started_list)) {
-			dep->flags |= DWC3_EP_PENDING_REQUEST;
-			dbg_event(dep->number, "STARTEDBEFLISTEMPTY", 0);
-		}
-
+	if (usb_endpoint_xfer_isoc(dep->endpoint.desc) &&
+					(list_empty(&dep->started_list))) {
+		dep->flags |= DWC3_EP_PENDING_REQUEST;
+		dbg_event(dep->number, "STARTEDLISTEMPTY", 0);
 		dbg_log_string("%s(%d): Give back reqhere1 %p len(%d) actual(%d))",
 			dep->name, dep->number, &req->request,
 			req->request.length, req->request.actual);
@@ -1066,6 +1064,8 @@ static int dwc3_gadget_ep_disable(struct usb_ep *ep)
 	spin_lock_irqsave(&dwc->lock, flags);
 	ret = __dwc3_gadget_ep_disable(dep);
 	dbg_event(dep->number, "DISABLE", ret);
+	dbg_event(dep->number, "MISSEDISOCPKTS", dep->missed_isoc_packets);
+	dep->missed_isoc_packets = 0;
 	dbg_event(dep->number, "DISABLEFAILPKT", dep->failedpkt_counter);
 	dep->failedpkt_counter = 0;
 	spin_unlock_irqrestore(&dwc->lock, flags);
@@ -1654,7 +1654,8 @@ static void __dwc3_gadget_start_isoc(struct dwc3_ep *dep)
 	if (__dwc3_gadget_get_frame(dep->dwc) < dep->frame_number)
 		wraparound_bits += BIT(14);
 
-	dep->frame_number = __dwc3_gadget_get_frame(dep->dwc) +  max_t(u32, 16, 2 * dep->interval);
+	dep->frame_number = __dwc3_gadget_get_frame(dep->dwc) +
+				max_t(u32, 16, 2 * dep->interval);
 
 	/* align uf to ep interval */
 	dep->frame_number = (wraparound_bits | dep->frame_number) &
@@ -2498,8 +2499,11 @@ static int dwc3_gadget_pullup(struct usb_gadget *g, int is_on)
 	/* prevent pending bh to run later */
 	flush_work(&dwc->bh_work);
 
-	if (is_on)
-		dwc3_device_core_soft_reset(dwc);
+	if (is_on) {
+		ret = dwc3_device_core_soft_reset(dwc);
+		if (ret != 0)
+			goto done;
+	}
 
 	spin_lock_irqsave(&dwc->lock, flags);
 	if (dwc->ep0state != EP0_SETUP_PHASE)
@@ -2528,6 +2532,7 @@ static int dwc3_gadget_pullup(struct usb_gadget *g, int is_on)
 	}
 	enable_irq(dwc->irq);
 
+done:
 	pm_runtime_mark_last_busy(dwc->dev);
 	pm_runtime_put_autosuspend(dwc->dev);
 	dbg_event(0xFF, "Pullup put",
@@ -3217,6 +3222,8 @@ static void dwc3_gadget_endpoint_transfer_in_progress(struct dwc3_ep *dep,
 	if (event->status & DEPEVT_STATUS_MISSED_ISOC) {
 		status = -EXDEV;
 
+		dep->missed_isoc_packets++;
+		dbg_event(dep->number, "MISSEDISOC", 0);
 		microframe = __dwc3_gadget_get_frame(dwc);
 		dep->failedpkt_counter++;
 		dbg_event(dep->number, "CURRFRAME", microframe);
@@ -3225,9 +3232,10 @@ static void dwc3_gadget_endpoint_transfer_in_progress(struct dwc3_ep *dep,
 
 	dwc3_gadget_ep_cleanup_completed_requests(dep, event, status);
 
-	if (usb_endpoint_xfer_isoc(dep->endpoint.desc) && (list_empty(&dep->started_list))) {
+	if (usb_endpoint_xfer_isoc(dep->endpoint.desc) &&
+					(list_empty(&dep->started_list))) {
 		stop = true;
-		dbg_event(dep->number, "STOTXFERHERE", dep->frame_number);
+		dbg_event(dep->number, "STOPXFER", dep->frame_number);
 	}
 
 	if (stop)
